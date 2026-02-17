@@ -6,6 +6,9 @@ data/processed/*.csv
 # Models (binary files)
 models/*.rds
 
+# Keep report figures (screenshots for README)
+!reports/figures/
+
 # R environment
 .Rhistory
 .Rdata

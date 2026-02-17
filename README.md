@@ -93,14 +93,25 @@ The Shiny dashboard has three tabs designed for different users:
 Browse listings on an interactive Leaflet map. Filter by city, room type, guests, bedrooms, and price. Green dots = affordable, red dots = expensive. Click any listing for details.
 
 <div align="center">
-<em>Select a city → filter by your preferences → see which listings are expensive for their neighborhood</em>
+<img src="reports/figures/explore_map.png" alt="Explore Map" width="800"/>
+<br><em>Select a city → filter by your preferences → see which listings are expensive for their neighborhood</em>
 </div>
 
 ### Price Check
 Enter your listing details and get an instant prediction: is your listing priced in the premium tier? Adjust inputs to see what would push your listing into (or out of) the top 25%.
 
+<div align="center">
+<img src="reports/figures/price_check.png" alt="Price Check" width="800"/>
+<br><em>Enter listing details → get instant prediction with confidence score</em>
+</div>
+
 ### Insights
 Model performance comparison, feature importance, cross-city generalization results. For anyone interested in the technical methodology.
+
+<div align="center">
+<img src="reports/figures/insights.png" alt="Model Insights" width="800"/>
+<br><em>Model comparison, feature importance, and cross-city generalization results</em>
+</div>
 
 ## 🚀 Getting Started
 
