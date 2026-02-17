@@ -1,0 +1,380 @@
+---
+title: "Modeling — Predicting Expensive Airbnb Listings"
+author: "Tisha Patel"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+```
+
+# 1. Setup
+
+```{r}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(e1071)
+library(pROC)
+
+df <- read_csv("data/processed/airbnb_cleaned.csv", show_col_types = FALSE)
+df$is_expensive <- as.factor(df$is_expensive)
+
+cat("Dataset:", nrow(df), "rows |", ncol(df), "columns |", n_distinct(df$city), "cities\n")
+cat("Target:", table(df$is_expensive)["0"], "not expensive |", table(df$is_expensive)["1"], "expensive\n")
+```
+
+
+# 2. Feature Selection
+
+Based on EDA, correlation analysis, and VIF results, we select features that are
+informative without being redundant.
+
+```{r}
+# Features for modeling — dropping price since it defines the target
+model_features <- c(
+  "latitude", "longitude", "accommodates", "bedrooms", "beds", "bathrooms",
+  "availability_365", "number_of_reviews", "number_of_reviews_ltm",
+  "reviews_per_month", "review_scores_rating", "review_scores_cleanliness",
+  "review_scores_location", "review_scores_value",
+  "minimum_nights", "host_is_superhost", "host_years",
+  "host_listings_count", "instant_bookable", "is_professional_host",
+  "calculated_host_listings_count"
+)
+
+# One-hot encode room_type
+df <- df %>%
+  mutate(
+    room_private = ifelse(room_type_simple == "Private room", 1, 0),
+    room_hotel = ifelse(room_type_simple == "Hotel room", 1, 0),
+    room_shared = ifelse(room_type_simple == "Shared room", 1, 0)
+  )
+
+model_features <- c(model_features, "room_private", "room_hotel", "room_shared")
+
+# Keep only what we need
+model_df <- df %>%
+  select(is_expensive, all_of(model_features)) %>%
+  drop_na()
+
+cat("Modeling dataset:", nrow(model_df), "rows |", length(model_features), "features\n")
+```
+
+
+# 3. Train / Test Split
+
+```{r}
+set.seed(42)
+train_idx <- createDataPartition(model_df$is_expensive, p = 0.7, list = FALSE)
+train <- model_df[train_idx, ]
+test <- model_df[-train_idx, ]
+
+cat("Train:", nrow(train), "| Test:", nrow(test), "\n")
+cat("Train expensive %:", round(mean(train$is_expensive == 1) * 100, 1), "\n")
+cat("Test expensive %:", round(mean(test$is_expensive == 1) * 100, 1), "\n")
+```
+
+
+# 4. Logistic Regression (Baseline)
+
+Starting with logistic regression as a simple baseline to beat.
+
+```{r}
+logit_model <- glm(is_expensive ~ ., data = train, family = binomial)
+
+logit_probs <- predict(logit_model, newdata = test, type = "response")
+logit_preds <- factor(ifelse(logit_probs > 0.5, 1, 0), levels = c(0, 1))
+
+cat("=== Logistic Regression ===\n")
+logit_cm <- confusionMatrix(logit_preds, test$is_expensive, positive = "1")
+print(logit_cm)
+```
+
+```{r}
+# ROC curve for logistic regression
+logit_roc <- roc(test$is_expensive, logit_probs)
+cat("Logistic Regression AUC:", round(auc(logit_roc), 4), "\n")
+```
+
+
+# 5. Random Forest
+
+```{r}
+set.seed(42)
+rf_model <- randomForest(
+  is_expensive ~ .,
+  data = train,
+  ntree = 300,
+  importance = TRUE
+)
+
+rf_preds <- predict(rf_model, newdata = test)
+rf_probs <- predict(rf_model, newdata = test, type = "prob")[, "1"]
+
+cat("=== Random Forest ===\n")
+rf_cm <- confusionMatrix(rf_preds, test$is_expensive, positive = "1")
+print(rf_cm)
+```
+
+```{r}
+# Variable importance
+importance_df <- as.data.frame(importance(rf_model)) %>%
+  rownames_to_column("feature") %>%
+  arrange(desc(MeanDecreaseGini))
+
+ggplot(importance_df %>% head(15), aes(x = reorder(feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Random Forest — Top 15 Feature Importance",
+       x = NULL, y = "Mean Decrease in Gini") +
+  theme_minimal()
+
+ggsave("reports/figures/rf_importance.png", width = 10, height = 6, dpi = 300)
+```
+
+```{r}
+# ROC for RF
+rf_roc <- roc(test$is_expensive, rf_probs)
+cat("Random Forest AUC:", round(auc(rf_roc), 4), "\n")
+```
+
+
+# 6. Random Forest — Hyperparameter Tuning
+
+Using 5-fold cross-validation to find the best mtry.
+
+```{r}
+set.seed(42)
+tune_control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# caret needs factor levels to be valid R names
+train_caret <- train %>%
+  mutate(is_expensive = factor(ifelse(is_expensive == 1, "expensive", "not_expensive")))
+
+test_caret <- test %>%
+  mutate(is_expensive = factor(ifelse(is_expensive == 1, "expensive", "not_expensive")))
+
+mtry_grid <- expand.grid(mtry = c(3, 5, 7, 10, 15))
+
+rf_tuned <- train(
+  is_expensive ~ .,
+  data = train_caret,
+  method = "rf",
+  metric = "ROC",
+  tuneGrid = mtry_grid,
+  trControl = tune_control,
+  ntree = 300
+)
+
+print(rf_tuned)
+plot(rf_tuned)
+```
+
+```{r}
+# Evaluate tuned model on test set
+rf_tuned_preds <- predict(rf_tuned, newdata = test_caret)
+rf_tuned_probs <- predict(rf_tuned, newdata = test_caret, type = "prob")[, "expensive"]
+
+cat("=== Tuned Random Forest ===\n")
+rf_tuned_cm <- confusionMatrix(rf_tuned_preds, test_caret$is_expensive, positive = "expensive")
+print(rf_tuned_cm)
+
+rf_tuned_roc <- roc(test_caret$is_expensive, rf_tuned_probs, levels = c("not_expensive", "expensive"))
+cat("Tuned RF AUC:", round(auc(rf_tuned_roc), 4), "\n")
+```
+
+
+# 7. XGBoost
+
+```{r}
+# Prepare matrices for xgboost
+train_matrix <- model.matrix(~ . - 1, data = train %>% select(-is_expensive))
+test_matrix <- model.matrix(~ . - 1, data = test %>% select(-is_expensive))
+
+train_label <- as.integer(as.character(train$is_expensive))
+test_label <- as.integer(as.character(test$is_expensive))
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+dtest <- xgb.DMatrix(data = test_matrix, label = test_label)
+
+set.seed(42)
+xgb_model <- xgb.train(
+  params = list(
+    max_depth = 6,
+    eta = 0.1,
+    objective = "binary:logistic",
+    eval_metric = "auc"
+  ),
+  data = dtrain,
+  nrounds = 200,
+  verbose = 0
+)
+
+xgb_probs <- predict(xgb_model, dtest)
+xgb_preds <- factor(ifelse(xgb_probs > 0.5, 1, 0), levels = c(0, 1))
+
+cat("=== XGBoost ===\n")
+xgb_cm <- confusionMatrix(xgb_preds, test$is_expensive, positive = "1")
+print(xgb_cm)
+```
+
+```{r}
+# XGBoost feature importance
+xgb_imp <- xgb.importance(model = xgb_model, feature_names = colnames(train_matrix))
+
+ggplot(xgb_imp %>% head(15), aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  labs(title = "XGBoost — Top 15 Feature Importance (Gain)",
+       x = NULL, y = "Gain") +
+  theme_minimal()
+
+ggsave("reports/figures/xgb_importance.png", width = 10, height = 6, dpi = 300)
+```
+
+```{r}
+xgb_roc <- roc(test$is_expensive, xgb_probs)
+cat("XGBoost AUC:", round(auc(xgb_roc), 4), "\n")
+```
+
+
+# 8. Model Comparison
+
+```{r}
+# ROC curves together
+plot(logit_roc, col = "orange", main = "ROC Curve Comparison", legacy.axes = TRUE)
+plot(rf_roc, col = "steelblue", add = TRUE)
+plot(xgb_roc, col = "darkgreen", add = TRUE)
+legend("bottomright",
+       legend = c(
+         paste0("Logistic (AUC: ", round(auc(logit_roc), 3), ")"),
+         paste0("Random Forest (AUC: ", round(auc(rf_roc), 3), ")"),
+         paste0("XGBoost (AUC: ", round(auc(xgb_roc), 3), ")")
+       ),
+       col = c("orange", "steelblue", "darkgreen"),
+       lwd = 2)
+```
+
+```{r}
+# Save ROC plot
+png("reports/figures/roc_comparison.png", width = 800, height = 600, res = 150)
+plot(logit_roc, col = "orange", main = "ROC Curve Comparison", legacy.axes = TRUE)
+plot(rf_roc, col = "steelblue", add = TRUE)
+plot(xgb_roc, col = "darkgreen", add = TRUE)
+legend("bottomright",
+       legend = c(
+         paste0("Logistic (AUC: ", round(auc(logit_roc), 3), ")"),
+         paste0("Random Forest (AUC: ", round(auc(rf_roc), 3), ")"),
+         paste0("XGBoost (AUC: ", round(auc(xgb_roc), 3), ")")
+       ),
+       col = c("orange", "steelblue", "darkgreen"),
+       lwd = 2)
+dev.off()
+```
+
+```{r}
+# Summary table
+comparison <- tibble(
+  Model = c("Logistic Regression", "Random Forest", "Random Forest (Tuned)", "XGBoost"),
+  Accuracy = c(
+    logit_cm$overall["Accuracy"],
+    rf_cm$overall["Accuracy"],
+    rf_tuned_cm$overall["Accuracy"],
+    xgb_cm$overall["Accuracy"]
+  ),
+  Sensitivity = c(
+    logit_cm$byClass["Sensitivity"],
+    rf_cm$byClass["Sensitivity"],
+    rf_tuned_cm$byClass["Sensitivity"],
+    xgb_cm$byClass["Sensitivity"]
+  ),
+  Specificity = c(
+    logit_cm$byClass["Specificity"],
+    rf_cm$byClass["Specificity"],
+    rf_tuned_cm$byClass["Specificity"],
+    xgb_cm$byClass["Specificity"]
+  ),
+  AUC = c(
+    round(auc(logit_roc), 4),
+    round(auc(rf_roc), 4),
+    round(auc(rf_tuned_roc), 4),
+    round(auc(xgb_roc), 4)
+  )
+) %>%
+  mutate(across(c(Accuracy, Sensitivity, Specificity), ~round(., 4)))
+
+print(comparison)
+```
+
+
+# 9. Cross-City Generalization
+
+Does a model trained on 5 cities generalize to the 6th? This tests real-world usefulness.
+
+```{r}
+# Build a modeling dataframe that keeps city for splitting
+# Use the already-encoded df (room_private etc. already exist)
+model_df_city <- df %>%
+  select(is_expensive, city, all_of(model_features)) %>%
+  drop_na()
+
+# Train on 5 cities, test on Hawaii
+train_cross <- model_df_city %>% filter(city != "Hawaii") %>% select(-city)
+test_cross <- model_df_city %>% filter(city == "Hawaii") %>% select(-city)
+
+cat("Train (5 cities):", nrow(train_cross), "| Test (Hawaii):", nrow(test_cross), "\n")
+
+set.seed(42)
+rf_cross <- randomForest(is_expensive ~ ., data = train_cross, ntree = 200)
+cross_preds <- predict(rf_cross, newdata = test_cross)
+
+cat("\n=== Cross-City: Train on 5 cities, Test on Hawaii ===\n")
+cross_cm <- confusionMatrix(cross_preds, test_cross$is_expensive, positive = "1")
+print(cross_cm)
+```
+
+```{r}
+# Reverse: train on Hawaii, test on other 5 cities
+train_cross2 <- model_df_city %>% filter(city == "Hawaii") %>% select(-city)
+test_cross2 <- model_df_city %>% filter(city != "Hawaii") %>% select(-city)
+
+set.seed(42)
+rf_cross2 <- randomForest(is_expensive ~ ., data = train_cross2, ntree = 200)
+cross_preds2 <- predict(rf_cross2, newdata = test_cross2)
+
+cat("=== Cross-City: Train on Hawaii, Test on 5 cities ===\n")
+cross_cm2 <- confusionMatrix(cross_preds2, test_cross2$is_expensive, positive = "1")
+print(cross_cm2)
+```
+
+
+# 10. Key Takeaways
+
+```{r}
+cat("
+============================================================
+                    FINAL RESULTS SUMMARY
+============================================================
+
+Best Model: Random Forest (Tuned via 5-fold CV)
+
+Model Comparison:
+")
+print(comparison)
+
+cat("
+Cross-City Generalization:
+  Train 5 cities -> Test Hawaii:", round(cross_cm$overall["Accuracy"] * 100, 1), "% accuracy
+  Train Hawaii -> Test 5 cities:", round(cross_cm2$overall["Accuracy"] * 100, 1), "% accuracy
+
+Top Predictive Features (from RF):
+")
+print(importance_df %>% head(10) %>% select(feature, MeanDecreaseGini))
+```

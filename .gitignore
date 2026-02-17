@@ -1,0 +1,21 @@
+# Data files (too large for GitHub)
+data/raw/*.csv
+data/raw/*.csv.gz
+data/processed/*.csv
+
+# Models (binary files)
+models/*.rds
+
+# R environment
+.Rhistory
+.Rdata
+.RData
+.Ruserdata
+.Rproj.user/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# HTML output (can be regenerated)
+*.html

@@ -1,0 +1,384 @@
+---
+title: "Exploratory Data Analysis & Statistical Testing"
+author: "Tisha Patel"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+```
+
+# 1. Setup
+
+```{r}
+library(tidyverse)
+library(corrplot)
+library(car)
+library(effectsize)
+
+df <- read_csv("data/processed/airbnb_cleaned.csv", show_col_types = FALSE)
+df$is_expensive <- as.factor(df$is_expensive)
+
+cat("Dataset:", nrow(df), "listings across", n_distinct(df$city), "cities\n")
+```
+
+# 2. Price Distribution Across Cities
+
+Before any modeling, we need to understand what the data looks like. Let's start with how price varies across our 6 cities.
+
+```{r}
+# Price distribution by city (log scale for readability)
+ggplot(df, aes(x = reorder(city, price, FUN = median), y = price, fill = city)) +
+  geom_boxplot(outlier.alpha = 0.2, outlier.size = 0.5) +
+  scale_y_log10(labels = scales::dollar) +
+  coord_flip() +
+  labs(title = "Airbnb Price Distribution by City",
+       subtitle = "Log scale | Median marked by center line",
+       x = NULL, y = "Nightly Price (log scale)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave("reports/figures/price_by_city.png", width = 10, height = 6, dpi = 300)
+```
+
+```{r}
+# Summary stats per city
+df %>%
+  group_by(city) %>%
+  summarise(
+    listings = n(),
+    median_price = median(price),
+    mean_price = round(mean(price), 2),
+    sd_price = round(sd(price), 2),
+    pct_expensive = round(mean(as.numeric(as.character(is_expensive))) * 100, 1)
+  ) %>%
+  arrange(desc(median_price))
+```
+
+# 3. Room Type Analysis
+
+```{r}
+# Room type breakdown by city
+ggplot(df, aes(x = city, fill = room_type_simple)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Room Type Composition by City",
+       x = NULL, y = "Proportion", fill = "Room Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("reports/figures/room_type_by_city.png", width = 10, height = 6, dpi = 300)
+```
+
+```{r}
+# Price by room type
+ggplot(df, aes(x = room_type_simple, y = price, fill = room_type_simple)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  scale_y_log10(labels = scales::dollar) +
+  labs(title = "Price Distribution by Room Type",
+       x = NULL, y = "Price (log scale)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave("reports/figures/price_by_room_type.png", width = 10, height = 6, dpi = 300)
+```
+
+
+# 4. Statistical Hypothesis Testing
+
+## 4.1 — Do entire homes cost significantly more than private rooms?
+
+We frame this as a two-sample t-test comparing nightly prices between entire homes and private rooms.
+
+- **H₀**: Mean price of entire homes = Mean price of private rooms
+- **H₁**: Mean price of entire homes ≠ Mean price of private rooms
+
+```{r}
+entire <- df %>% filter(room_type_simple == "Entire home") %>% pull(price)
+private <- df %>% filter(room_type_simple == "Private room") %>% pull(price)
+
+t_result <- t.test(entire, private, alternative = "two.sided")
+print(t_result)
+
+# Effect size (Cohen's d) — how big is the difference practically?
+cohens_d(entire, private)
+```
+
+```{r}
+cat("Mean entire home: $", round(mean(entire), 2), "\n")
+cat("Mean private room: $", round(mean(private), 2), "\n")
+cat("Difference: $", round(mean(entire) - mean(private), 2), "\n")
+cat("p-value:", format(t_result$p.value, scientific = TRUE), "\n")
+```
+
+The p-value is extremely small (< 0.05), so we reject the null hypothesis. Entire homes are significantly more expensive than private rooms. The Cohen's d value tells us the practical size of this difference.
+
+
+## 4.2 — Is there a relationship between room type and being expensive?
+
+Chi-square test of independence: does the proportion of expensive listings differ across room types?
+
+- **H₀**: Room type and being expensive are independent
+- **H₁**: Room type and being expensive are associated
+
+```{r}
+contingency <- table(df$room_type_simple, df$is_expensive)
+print(contingency)
+
+chi_result <- chisq.test(contingency)
+print(chi_result)
+
+# Cramér's V — strength of association
+cramers_v(contingency)
+```
+
+```{r}
+# Visualize the relationship
+df %>%
+  group_by(room_type_simple) %>%
+  summarise(pct_expensive = mean(as.numeric(as.character(is_expensive))) * 100) %>%
+  ggplot(aes(x = reorder(room_type_simple, pct_expensive), y = pct_expensive, fill = room_type_simple)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(pct_expensive, 1), "%")), hjust = -0.2) +
+  coord_flip() +
+  labs(title = "Percentage of Listings Classified as Expensive by Room Type",
+       x = NULL, y = "% Expensive") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  ylim(0, 50)
+
+ggsave("reports/figures/expensive_by_room_type.png", width = 10, height = 5, dpi = 300)
+```
+
+
+## 4.3 — Do prices differ significantly across cities?
+
+One-way ANOVA to test whether mean prices vary across our 6 cities.
+
+- **H₀**: Mean price is the same across all cities
+- **H₁**: At least one city has a different mean price
+
+```{r}
+anova_result <- aov(price ~ city, data = df)
+summary(anova_result)
+
+# Effect size (eta-squared)
+effectsize::eta_squared(anova_result)
+```
+
+```{r}
+# Post-hoc: which pairs of cities differ?
+tukey <- TukeyHSD(anova_result)
+tukey_df <- as.data.frame(tukey$city)
+tukey_df$pair <- rownames(tukey_df)
+
+# Show the 10 most significant differences
+tukey_df %>%
+  arrange(`p adj`) %>%
+  head(10) %>%
+  select(pair, diff, `p adj`)
+```
+
+
+## 4.4 — Does superhost status affect pricing?
+
+Welch's t-test comparing prices of superhost vs non-superhost listings.
+
+- **H₀**: Mean price for superhosts = Mean price for non-superhosts
+- **H₁**: Mean price for superhosts ≠ Mean price for non-superhosts
+
+```{r}
+# Round superhost to 0/1 (median imputation may have created 0.5 values)
+df$host_is_superhost <- round(df$host_is_superhost)
+
+super <- df %>% filter(host_is_superhost == 1) %>% pull(price)
+non_super <- df %>% filter(host_is_superhost == 0) %>% pull(price)
+
+cat("Superhosts:", length(super), "| Non-superhosts:", length(non_super), "\n")
+
+t_super <- t.test(super, non_super)
+print(t_super)
+cohens_d(super, non_super)
+```
+
+```{r}
+cat("Superhost mean: $", round(mean(super), 2), "\n")
+cat("Non-superhost mean: $", round(mean(non_super), 2), "\n")
+```
+
+
+## 4.5 — Does availability differ between expensive and non-expensive listings?
+
+- **H₀**: Mean availability_365 is the same for expensive and non-expensive
+- **H₁**: They differ
+
+```{r}
+exp_avail <- df %>% filter(is_expensive == 1) %>% pull(availability_365)
+nonexp_avail <- df %>% filter(is_expensive == 0) %>% pull(availability_365)
+
+t_avail <- t.test(exp_avail, nonexp_avail)
+print(t_avail)
+cohens_d(exp_avail, nonexp_avail)
+```
+
+
+# 5. Correlation Analysis
+
+```{r fig.width=10, fig.height=8}
+# Select numeric columns for correlation
+numeric_cols <- df %>%
+  select(price, accommodates, bedrooms, beds, bathrooms,
+         availability_365, number_of_reviews, reviews_per_month,
+         review_scores_rating, review_scores_cleanliness,
+         review_scores_location, review_scores_value,
+         host_listings_count, host_years, minimum_nights,
+         calculated_host_listings_count) %>%
+  drop_na()
+
+cor_matrix <- cor(numeric_cols)
+
+corrplot(cor_matrix, method = "color", type = "lower",
+         tl.cex = 0.7, tl.col = "black",
+         addCoef.col = "black", number.cex = 0.5,
+         title = "Correlation Heatmap of Numeric Features",
+         mar = c(0, 0, 2, 0))
+```
+
+```{r}
+# Save correlation plot
+png("reports/figures/correlation_heatmap.png", width = 1200, height = 1000, res = 150)
+corrplot(cor_matrix, method = "color", type = "lower",
+         tl.cex = 0.7, tl.col = "black",
+         addCoef.col = "black", number.cex = 0.5,
+         title = "Correlation Heatmap",
+         mar = c(0, 0, 2, 0))
+dev.off()
+```
+
+
+# 6. Multicollinearity Check (VIF)
+
+Before building models, we check for multicollinearity using Variance Inflation Factor. VIF > 5 suggests a variable is too correlated with others.
+
+```{r}
+# Fit a quick logistic regression to check VIF
+vif_model <- glm(
+  as.numeric(as.character(is_expensive)) ~ price + accommodates + bedrooms + beds + bathrooms +
+    availability_365 + number_of_reviews + reviews_per_month +
+    review_scores_rating + host_listings_count + minimum_nights +
+    host_years + instant_bookable,
+  data = df, family = binomial
+)
+
+vif_values <- vif(vif_model)
+vif_df <- data.frame(variable = names(vif_values), VIF = round(vif_values, 2))
+vif_df <- vif_df %>% arrange(desc(VIF))
+
+print(vif_df)
+cat("\nVariables with VIF > 5 (potential multicollinearity):\n")
+print(vif_df %>% filter(VIF > 5))
+```
+
+```{r}
+# Visualize VIF
+ggplot(vif_df, aes(x = reorder(variable, VIF), y = VIF, fill = VIF > 5)) +
+  geom_col() +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "red") +
+  coord_flip() +
+  scale_fill_manual(values = c("grey40", "tomato")) +
+  labs(title = "Variance Inflation Factor (VIF) for Predictor Variables",
+       subtitle = "Red dashed line = VIF threshold of 5",
+       x = NULL, y = "VIF") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave("reports/figures/vif_plot.png", width = 10, height = 6, dpi = 300)
+```
+
+
+# 7. Feature Distributions: Expensive vs Non-Expensive
+
+```{r fig.width=12, fig.height=8}
+# Compare key features between expensive and non-expensive listings
+plot_vars <- c("accommodates", "bedrooms", "bathrooms", "availability_365",
+               "number_of_reviews", "reviews_per_month", "review_scores_rating",
+               "minimum_nights", "host_years")
+
+df_long <- df %>%
+  select(is_expensive, all_of(plot_vars)) %>%
+  pivot_longer(-is_expensive, names_to = "feature", values_to = "value")
+
+ggplot(df_long, aes(x = is_expensive, y = value, fill = is_expensive)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  facet_wrap(~ feature, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("0" = "steelblue", "1" = "tomato"),
+                    labels = c("Not Expensive", "Expensive")) +
+  labs(title = "Feature Distributions: Expensive vs Non-Expensive Listings",
+       x = "Is Expensive", fill = NULL) +
+  theme_minimal()
+
+ggsave("reports/figures/feature_comparison.png", width = 12, height = 8, dpi = 300)
+```
+
+
+# 8. Geographic Patterns
+
+```{r fig.width=12, fig.height=8}
+# Map listings colored by expensive/non-expensive for each city
+ggplot(df, aes(x = longitude, y = latitude, color = is_expensive)) +
+  geom_point(alpha = 0.3, size = 0.5) +
+  facet_wrap(~ city, scales = "free", ncol = 3) +
+  scale_color_manual(values = c("0" = "steelblue", "1" = "tomato"),
+                     labels = c("Not Expensive", "Expensive")) +
+  labs(title = "Geographic Distribution of Expensive Listings",
+       color = NULL) +
+  theme_minimal() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+
+ggsave("reports/figures/geo_distribution.png", width = 12, height = 8, dpi = 300)
+```
+
+
+# 9. Summary of Statistical Findings
+
+```{r}
+# Compile all test results into a summary table
+results_summary <- tibble(
+  Test = c(
+    "Entire Home vs Private Room (t-test)",
+    "Room Type vs Expensive (Chi-square)",
+    "Price across Cities (ANOVA)",
+    "Superhost vs Non-superhost (t-test)",
+    "Availability: Expensive vs Not (t-test)"
+  ),
+  Null_Hypothesis = c(
+    "No price difference between room types",
+    "Room type and expensive are independent",
+    "Mean price is same across all cities",
+    "Superhost status doesn't affect price",
+    "Availability is same for both groups"
+  ),
+  p_value = c(
+    format(t_result$p.value, scientific = TRUE, digits = 3),
+    format(chi_result$p.value, scientific = TRUE, digits = 3),
+    format(summary(anova_result)[[1]]$`Pr(>F)`[1], scientific = TRUE, digits = 3),
+    format(t_super$p.value, scientific = TRUE, digits = 3),
+    format(t_avail$p.value, scientific = TRUE, digits = 3)
+  ),
+  Result = c(
+    ifelse(t_result$p.value < 0.05, "Reject H0", "Fail to Reject"),
+    ifelse(chi_result$p.value < 0.05, "Reject H0", "Fail to Reject"),
+    ifelse(summary(anova_result)[[1]]$`Pr(>F)`[1] < 0.05, "Reject H0", "Fail to Reject"),
+    ifelse(t_super$p.value < 0.05, "Reject H0", "Fail to Reject"),
+    ifelse(t_avail$p.value < 0.05, "Reject H0", "Fail to Reject")
+  )
+)
+
+print(results_summary)
+```
